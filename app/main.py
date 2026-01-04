@@ -1,29 +1,11 @@
-from data_utils import has_valid_age
+from fastapi import FastAPI
 
-def average_age(people: list[dict]) -> float:
-    total_age = 0
-    count = 0
+app = FastAPI()
 
-    for person in people:
-        if not has_valid_age(person):
-            continue
-        total_age += person["age"]
-        count += 1
-    if count == 0:
-        raise ValueError("No valid ages provided")
-    
-    return total_age / count
+@app.get("/")
+def root() -> dict:
+    return {"message": "AGentic AI service is running"}
 
-
-def main() -> None:
-    team = [
-        {"name": " Alice", "age": 34},
-        {"name": "Bob", "age": 44},
-        {"name": "Charlie", "age": 23},
-    ]
-
-    age = average_age(team)
-    print (f"Average Age: {age}")
-
-if __name__ == "__main__":
-    main()
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok"}
