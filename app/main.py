@@ -6,6 +6,8 @@ from fastapi import FastAPI
 from dotenv import load_dotenv
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
+from app.errors import ClientError, OperationalError
+
 
 
 
@@ -35,20 +37,32 @@ logger = logging.getLogger("agentic-ai")
 
 app = FastAPI()
 
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    logger.error(
-        "Unhandled exception",
-        extra={
-            "path": request.url.path,
-            "error": str(exc),
-        },
-        exc_info=True,
+from fastapi.responses import JSONResponse
+from fastapi import Request
+
+@app.exception_handler(ClientError)
+async def client_error_handler(request: Request, exc: ClientError):
+    logger.warning(
+        "Client error",
+        extra={"path": request.url.path, "error": str(exc)},
     )
     return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal server error"},
+        status_code=400,
+        content={"error_type": "client_error", "detail": str(exc)},
     )
+
+
+@app.exception_handler(OperationalError)
+async def operational_error_handler(request: Request, exc: OperationalError):
+    logger.error(
+        "Operational error",
+        extra={"path": request.url.path, "error": str(exc)},
+    )
+    return JSONResponse(
+        status_code=503,
+        content={"error_type": "operational_error", "detail": str(exc)},
+    )
+
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
@@ -86,16 +100,12 @@ logger.info(
 
 @app.get("/square")
 def square(n: int):
+    #raise OperationalError("database unavailable")
+
     if n < 0:
-        logger.warning(
-            "Invalid input for square",
-            extra={"n": n}
-        )
-        raise HTTPException(
-            status_code=400,
-            detail="n must be non-negative"
-        )
+        raise ClientError("n must be non-negative")
     return {"n": n, "square": n * n}
+
 
 
 @app.get("/")
