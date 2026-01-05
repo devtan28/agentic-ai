@@ -4,6 +4,10 @@ import uuid
 from fastapi import Request
 from fastapi import FastAPI
 from dotenv import load_dotenv
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
+
+
 
 load_dotenv()
 
@@ -30,6 +34,21 @@ logging.basicConfig(
 logger = logging.getLogger("agentic-ai")
 
 app = FastAPI()
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error(
+        "Unhandled exception",
+        extra={
+            "path": request.url.path,
+            "error": str(exc),
+        },
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
@@ -64,6 +83,19 @@ logger.info(
         "environment": ENVIRONMENT,
     },
 )
+
+@app.get("/square")
+def square(n: int):
+    if n < 0:
+        logger.warning(
+            "Invalid input for square",
+            extra={"n": n}
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="n must be non-negative"
+        )
+    return {"n": n, "square": n * n}
 
 
 @app.get("/")
