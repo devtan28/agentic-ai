@@ -1,5 +1,7 @@
 import os
 import logging
+import uuid
+from fastapi import Request
 from fastapi import FastAPI
 from dotenv import load_dotenv
 
@@ -29,6 +31,32 @@ logger = logging.getLogger("agentic-ai")
 
 app = FastAPI()
 
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
+
+    logger.info(
+        "Request started",
+        extra={
+            "request_id": request_id,
+            "method": request.method,
+            "path": request.url.path,
+        },
+    )
+
+    response = await call_next(request)
+
+    logger.info(
+        "Request finished",
+        extra={
+            "request_id": request_id,
+            "status_code": response.status_code,
+        },
+    )
+
+    return response
+
 logger.info(
     "Service starting",
     extra={
@@ -39,16 +67,30 @@ logger.info(
 
 
 @app.get("/")
-def root() -> dict:
-    logger.info("Root endpoint called")
+def root(request: Request) -> dict:
+    logger.info(
+        "Root endpoint called",
+        extra={"request_id": request.state.request_id},
+    )
     return {
         "service": SERVICE_NAME,
         "environment": ENVIRONMENT,
         "message": "Service is running",
+        "request_id": request.state.request_id,
     }
 
 
+
 @app.get("/health")
-def health() -> dict:
-    logger.debug("Health check called")
-    return {"status": "ok"}
+def health(request: Request) -> dict:
+    logger.debug(
+        "Health check called",
+        extra={"request_id": request.state.request_id},
+        )
+    
+    return {
+        "service": SERVICE_NAME,
+        "environment": ENVIRONMENT,
+        "message": "Status OK",
+        "request_id": request.state.request_id,
+        }
