@@ -4,7 +4,7 @@ import uuid
 from fastapi import Request
 from fastapi import FastAPI
 from dotenv import load_dotenv
-from fastapi import HTTPException
+from fastapi import HTTPException, Header
 from fastapi.responses import JSONResponse
 from app.errors import ClientError, OperationalError
 import random
@@ -35,6 +35,48 @@ logging.basicConfig(
 logger = logging.getLogger("agentic-ai")
 
 app = FastAPI()
+
+def cleanup_idempotency_store():
+    now = time.time()
+    expired_keys = [
+        key 
+        for key, record in idempotency_store.items()
+        if now - record["created at"] > IDEMPOTENCY_TTL_SECONDS
+    ]
+
+    for key in expired_keys:
+        del idempotency_store[key]
+
+@app.post("/create-item")
+def create_item(
+    name: str,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    if not idempotency_key:
+        raise HTTPException(
+            status_code = 400,
+            detail="Idempotency_Key header is required",
+        )
+    if idempotency_key in idempotency_store:
+        logger.info(
+            "Idempotent replay detected",
+            extra={"idempotency key": idempotency_key},
+        )
+        return copy.deepcopy(idempotency_store[idempotency_key])
+    
+    #Simulation creation
+    item = {"id": len(idempotency_store) + 1, "name":name}
+
+    response = {"item":item}
+
+    idempotency_store[idempotency_key] = copy.deepcopy(response)
+
+    logger.info(
+        "item created",
+        extra={"idempotency_key": idempotency_key, "item_id":item["id"]}
+    )
+
+    return response
 
 def unreliable_service() -> str:
     if random.random() < 0.5:
