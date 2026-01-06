@@ -9,6 +9,18 @@ from fastapi.responses import JSONResponse
 from app.errors import ClientError, OperationalError
 import random
 import time
+import copy
+from typing import TypedDict
+from threading import Lock
+
+idempotency_lock = Lock()
+IDEMPOTENCY_TTL_SECONDS = 60 * 60
+
+class IdempotencyRecord(TypedDict):
+    response: dict
+    created_at: float
+
+idempotency_store: dict[str, IdempotencyRecord] = {}
 
 load_dotenv()
 
@@ -57,19 +69,20 @@ def create_item(
             status_code = 400,
             detail="Idempotency_Key header is required",
         )
-    if idempotency_key in idempotency_store:
-        logger.info(
-            "Idempotent replay detected",
-            extra={"idempotency key": idempotency_key},
-        )
-        return copy.deepcopy(idempotency_store[idempotency_key])
+    with idempotency_lock:
+        record = idempotency_store.get(idempotency_key)
+
+    if record:
+        return copy.deepcopy(record["response"])
     
     #Simulation creation
     item = {"id": len(idempotency_store) + 1, "name":name}
-
     response = {"item":item}
 
-    idempotency_store[idempotency_key] = copy.deepcopy(response)
+    idempotency_store[idempotency_key] = {
+        "response": copy.deepcopy(response),
+        "created at": time.time()
+    }
 
     logger.info(
         "item created",
