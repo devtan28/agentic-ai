@@ -7,9 +7,8 @@ from dotenv import load_dotenv
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from app.errors import ClientError, OperationalError
-
-
-
+import random
+import time
 
 load_dotenv()
 
@@ -37,8 +36,29 @@ logger = logging.getLogger("agentic-ai")
 
 app = FastAPI()
 
-from fastapi.responses import JSONResponse
-from fastapi import Request
+def unreliable_service() -> str:
+    if random.random() < 0.5:
+        raise OperationalError("Temporary upsteream error")
+    return "success"
+
+def call_with_retry(fn, retries: int = 3, delay: float = 0.5):
+    for attempt in range(1, retries +1):
+        try:
+            return fn()
+        except OperationalError as exc:
+            last_exc = exc
+            logger.warning(
+                "Retryable failure",
+                extra={"attempt": attempt, "error": str(exc)}
+            )
+        if attempt == retries:
+            raise last_exc
+        time.sleep(delay * attempt)
+
+@app.get("/unstable")
+def unstable():
+    result = call_with_retry(unreliable_service)
+    return {"result": result}
 
 @app.exception_handler(ClientError)
 async def client_error_handler(request: Request, exc: ClientError):
@@ -97,6 +117,13 @@ logger.info(
         "environment": ENVIRONMENT,
     },
 )
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
 
 @app.get("/square")
 def square(n: int):
