@@ -48,6 +48,30 @@ logger = logging.getLogger("agentic-ai")
 
 app = FastAPI()
 
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+
+    #attach to request state
+    request.state.request_id = request_id
+
+    logger.info(
+        "Request started",
+        extra={"request_id": request_id, "path": request.url.path},
+    )
+
+    response = await call_next(request)
+
+    logger.info(
+        "Request completed",
+        extra={
+            "request_id": request_id,
+            "path": request.url.path,
+            "status_code": response.status_code,
+        },
+    )
+    return response
+
 def cleanup_idempotency_store():
     now = time.time()
     expired_keys = [
@@ -61,6 +85,7 @@ def cleanup_idempotency_store():
 
 @app.post("/create-item")
 def create_item(
+    request: Request,
     name: str,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
@@ -86,7 +111,11 @@ def create_item(
 
     logger.info(
         "item created",
-        extra={"idempotency_key": idempotency_key, "item_id":item["id"]}
+        extra={
+            "request_id": request.state.request_id,
+            "idempotency_key": idempotency_key, 
+            "item_id": item["id"],
+            },
     )
 
     return response
@@ -126,7 +155,6 @@ async def client_error_handler(request: Request, exc: ClientError):
         content={"error_type": "client_error", "detail": str(exc)},
     )
 
-
 @app.exception_handler(OperationalError)
 async def operational_error_handler(request: Request, exc: OperationalError):
     logger.error(
@@ -137,7 +165,6 @@ async def operational_error_handler(request: Request, exc: OperationalError):
         status_code=503,
         content={"error_type": "operational_error", "detail": str(exc)},
     )
-
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
@@ -188,8 +215,6 @@ def square(n: int):
         raise ClientError("n must be non-negative")
     return {"n": n, "square": n * n}
 
-
-
 @app.get("/")
 def root(request: Request) -> dict:
     logger.info(
@@ -202,8 +227,6 @@ def root(request: Request) -> dict:
         "message": "Service is running",
         "request_id": request.state.request_id,
     }
-
-
 
 @app.get("/health")
 def health(request: Request) -> dict:
