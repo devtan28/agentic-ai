@@ -18,6 +18,11 @@ from collections import defaultdict
 idempotency_lock = Lock()
 IDEMPOTENCY_TTL_SECONDS = 60 * 60
 
+HEALTH_THRESHOLDS = {
+    "max_error_rate": 0.05,     # 5%
+    "max_retry_rate": 0.10,     # 10%
+    "max_avg_latency_ms": 500,  # 500ms
+}
 metrics = {
     "requests_total": 0,
     "errors_total": 0,
@@ -117,6 +122,45 @@ async def add_request_id(request: Request, call_next):
             },
         )
    
+def evaluate_health():
+    if metrics["requests_total"] == 0:
+        return {"status": "healthy", "reason": "no traffic yet"}
+    
+    error_rate = metrics["errors_total"] / metrics["requests_total"]
+    retry_rate = metrics["retries_total"] / metrics["requests_total"]
+    avg_latency = (
+        sum(metrics["latency_ms"]) / len(metrics["latency_ms"])
+        if metrics["latency_ms"]
+        else 0
+    )
+
+    if error_rate > HEALTH_THRESHOLDS["max_error_rate"]:
+        return {
+            "status": "unhealthy",
+            "reason": "error rate too high",
+            "error_rate": round(error_rate, 3)
+        }
+    
+    if retry_rate > HEALTH_THRESHOLDS["max_retry_rate"]:
+        return {
+            "status": "unhealthy",
+            "reason": "retry rate too high",
+            "retry_rate": round(retry_rate, 3)
+        }
+
+    if avg_latency > HEALTH_THRESHOLDS["max_avg_latency_ms"]:
+        return {
+            "status": "degraded",
+            "reason": "avg latency too high",
+            "retry_rate": round(avg_latency, 2)
+        }
+    
+    return {
+        "status": "healthy",
+        "error_rate": round(error_rate, 3),
+        "retry_rate": round(retry_rate, 3),
+        "avg_latency_ms": round(avg_latency, 2),
+    }
 
 def cleanup_idempotency_store():
     now = time.time()
@@ -204,6 +248,20 @@ def get_metrics():
         "retries_total": metrics["retries_total"],
         "avg_latency_ms": round(avg_latency, 2),
     }
+
+@app.get("/health")
+def health():
+    health_state = evaluate_health()
+
+    logger.info(
+        "Health evaluated",
+        extra={
+            "status": health_state["status"],
+            "reason": health_state.get("reason")
+        },
+    )
+
+    return health_state
 
 @app.exception_handler(ClientError)
 async def client_error_handler(request: Request, exc: ClientError):
