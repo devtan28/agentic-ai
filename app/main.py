@@ -1,5 +1,6 @@
 import os
-import logging
+import logging, json
+from datetime import datetime
 import uuid
 from fastapi import Request
 from fastapi import FastAPI
@@ -15,6 +16,28 @@ from threading import Lock
 
 idempotency_lock = Lock()
 IDEMPOTENCY_TTL_SECONDS = 60 * 60
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        log_record = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+
+        #include structured context if present
+        for field in {
+            "request_id",
+            "idempotency_key",
+            "item_id",
+            "path",
+            "status_code",
+        }:
+            if hasattr(record, field):
+                log_record[field] = getattr(record, field)
+
+        return json.dumps(log_record)
 
 class IdempotencyRecord(TypedDict):
     response: dict
@@ -44,7 +67,13 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
+handler = logging.StreamHandler()
+handler.setFormatter(JsonFormatter())
+
 logger = logging.getLogger("agentic-ai")
+logger.setLevel(logging.INFO)
+logger.addHandler(handler)
+logger.propagate = False
 
 app = FastAPI()
 
