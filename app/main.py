@@ -13,10 +13,17 @@ import time
 import copy
 from typing import TypedDict
 from threading import Lock
+from collections import defaultdict
 
 idempotency_lock = Lock()
 IDEMPOTENCY_TTL_SECONDS = 60 * 60
 
+metrics = {
+    "requests_total": 0,
+    "errors_total": 0,
+    "retries_total": 0,
+    "latency_ms": [],
+}
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         log_record = {
@@ -79,27 +86,37 @@ app = FastAPI()
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
-    request_id = str(uuid.uuid4())
+    start_time = time.time()
 
-    #attach to request state
+    request_id = str(uuid.uuid4())
+    # attach to request state
     request.state.request_id = request_id
+
+    metrics["requests_total"] += 1
 
     logger.info(
         "Request started",
         extra={"request_id": request_id, "path": request.url.path},
     )
+    try:
+        response = await call_next(request)
+        return response
+    except Exception:
+        metrics["errors_total"] += 1
+        raise
+    finally:
+        duration_ms = (time.time() - start_time) * 1000
+        metrics["latency_ms"].append(duration_ms)
 
-    response = await call_next(request)
-
-    logger.info(
-        "Request completed",
-        extra={
-            "request_id": request_id,
-            "path": request.url.path,
-            "status_code": response.status_code,
-        },
-    )
-    return response
+        logger.info(
+            "Request completed",
+            extra={
+                "request_id": request_id,
+                "path": request.url.path,
+                "duration_ms": round(duration_ms, 2),
+            },
+        )
+   
 
 def cleanup_idempotency_store():
     now = time.time()
@@ -172,6 +189,21 @@ def call_with_retry(fn, retries: int = 3, delay: float = 0.5):
 def unstable():
     result = call_with_retry(unreliable_service)
     return {"result": result}
+
+@app.get("/metrics")
+def get_metrics():
+    avg_latency = (
+        sum(metrics["latency_ms"]) / len(metrics["latency_ms"])
+        if metrics["latency_ms"]
+        else 0
+    )
+
+    return {
+        "request_total": metrics["requests_total"],
+        "errors_total": metrics["errors_total"],
+        "retries_total": metrics["retries_total"],
+        "avg_latency_ms": round(avg_latency, 2),
+    }
 
 @app.exception_handler(ClientError)
 async def client_error_handler(request: Request, exc: ClientError):
