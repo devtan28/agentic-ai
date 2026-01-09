@@ -127,18 +127,17 @@ async def add_request_id(request: Request, call_next):
 
 @app.middleware("http")
 async def circuit_breaker_guard(request: Request, call_next):
+    # Allow control-plane endpoints always
+    if request.url.path in ("/health", "/metrics"):
+        return await call_next(request)
+
     state = evaluate_cricuit()
 
     if state == "OPEN":
-        logger.warning (
-            "Circuit breaker open - rejecting request",
-            extra= {"path": request.url.path},
-        )
         return JSONResponse(
             status_code = 503,
             content={"detail": "Service temporarily unavailable"},
         )
-    
     return await call_next(request)
 
 def evaluate_health():
@@ -162,7 +161,7 @@ def evaluate_health():
     
     if retry_rate > HEALTH_THRESHOLDS["max_retry_rate"]:
         return {
-            "status": "unhealthy",
+            "status": "degraded",
             "reason": "retry rate too high",
             "retry_rate": round(retry_rate, 3)
         }
@@ -235,7 +234,7 @@ def unreliable_service() -> str:
     return "success"
 
 def call_with_retry(fn, retries: int = 3, delay: float = 0.5):
-    for attempt in range(1, retries +1):
+    for attempt in range(1, retries + 1):
         try:
             return fn()
         except OperationalError as exc:
@@ -248,6 +247,8 @@ def call_with_retry(fn, retries: int = 3, delay: float = 0.5):
         if attempt == retries:
             raise last_exc
         time.sleep(delay * attempt)
+    logger.warning("Retries exhausted - returning fallback")
+    return "fallback"
 
 @app.get("/unstable")
 def unstable():
@@ -377,16 +378,24 @@ def square(n: int):
     return {"n": n, "square": n * n}
 
 @app.get("/")
-def root(request: Request) -> dict:
-    logger.info(
-        "Root endpoint called",
-        extra={"request_id": request.state.request_id},
-    )
+def root():
+    health = evaluate_health()
+
+    if health["status"] == "degraded":
+        return {
+            "status": "degraded",
+            "message": "Serving fallback response",
+            "data": {
+                "service": SERVICE_NAME,
+                "mode": "fallback",
+            },
+        }
+
     return {
+        "status": "ok",
         "service": SERVICE_NAME,
         "environment": ENVIRONMENT,
         "message": "Service is running",
-        "request_id": request.state.request_id,
     }
 
 @app.get("/health")
