@@ -8,10 +8,23 @@ from fastapi.responses import JSONResponse
 from app.errors import ClientError, OperationalError
 from typing import TypedDict
 from threading import Lock
-from collections import defaultdict
+from collections import defaultdict, deque
 
 idempotency_lock = Lock()
 IDEMPOTENCY_TTL_SECONDS = 60 * 60
+
+WINDOWS_SECONDS = 30
+
+metrics = {
+    "requests": deque(),
+    "errors": deque(),
+    "retries": deque(),
+    "latencies": deque(),
+    "requests_total": 0,
+    "errors_total": 0,
+    "retries_total": 0,
+    "latency_ms": [],
+}
 
 HEALTH_THRESHOLDS = {
     "max_error_rate": 0.05,     # 5%
@@ -24,14 +37,8 @@ CIRCUIT_STATE = {
     "opened_at": None,
 }
 
-CIRCUIT_OPEN_TIMEOUT = 5 # seconds
+CIRCUIT_OPEN_TIMEOUT = 30 # seconds
 
-metrics = {
-    "requests_total": 0,
-    "errors_total": 0,
-    "retries_total": 0,
-    "latency_ms": [],
-}
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         log_record = {
@@ -101,6 +108,8 @@ async def add_request_id(request: Request, call_next):
     request.state.request_id = request_id
 
     metrics["requests_total"] += 1
+    now = time.time()
+    metrics["requests"].append(now)
 
     logger.info(
         "Request started",
@@ -111,10 +120,12 @@ async def add_request_id(request: Request, call_next):
         return response
     except Exception:
         metrics["errors_total"] += 1
+        metrics["errors"].append(time.time())
         raise
     finally:
         duration_ms = (time.time() - start_time) * 1000
         metrics["latency_ms"].append(duration_ms)
+        metrics["latencies"].append((time.time(), duration_ms))
 
         logger.info(
             "Request completed",
@@ -141,17 +152,21 @@ async def circuit_breaker_guard(request: Request, call_next):
     return await call_next(request)
 
 def evaluate_health():
+    prune_old_events()
+
+    req_count = len(metrics["requests"])
+    err_count = len(metrics["errors"])
+    retry_count = len(metrics["retries"])
+
+    if req_count == 0:
+        return {"status": "healthy", "reason": "no recent traffic"}
+    
+    error_rate = err_count / req_count
+    retry_rate = retry_count / req_count
+
     if metrics["requests_total"] == 0:
         return {"status": "healthy", "reason": "no traffic yet"}
     
-    error_rate = metrics["errors_total"] / metrics["requests_total"]
-    retry_rate = metrics["retries_total"] / metrics["requests_total"]
-    avg_latency = (
-        sum(metrics["latency_ms"]) / len(metrics["latency_ms"])
-        if metrics["latency_ms"]
-        else 0
-    )
-
     if error_rate > HEALTH_THRESHOLDS["max_error_rate"]:
         return {
             "status": "unhealthy",
@@ -165,19 +180,11 @@ def evaluate_health():
             "reason": "retry rate too high",
             "retry_rate": round(retry_rate, 3)
         }
-
-    if avg_latency > HEALTH_THRESHOLDS["max_avg_latency_ms"]:
-        return {
-            "status": "degraded",
-            "reason": "avg latency too high",
-            "retry_rate": round(avg_latency, 2)
-        }
     
     return {
         "status": "healthy",
         "error_rate": round(error_rate, 3),
         "retry_rate": round(retry_rate, 3),
-        "avg_latency_ms": round(avg_latency, 2),
     }
 
 def cleanup_idempotency_store():
@@ -240,6 +247,7 @@ def call_with_retry(fn, retries: int = 3, delay: float = 0.5):
         except OperationalError as exc:
             last_exc = exc
             metrics["retries_total"] += 1
+            metrics["retries"].append(time.time())
             logger.warning(
                 "Retryable failure",
                 extra={"attempt": attempt, "error": str(exc)}
@@ -411,3 +419,13 @@ def health(request: Request) -> dict:
         "message": "Status OK",
         "request_id": request.state.request_id,
         }
+
+def prune_old_events():
+    cutoff = time.time() - WINDOWS_SECONDS
+
+    for key in ["requests", "errors", "retries"]:
+        while metrics[key] and metrics[key][0] < cutoff:
+            metrics[key].popleft()
+
+    while metrics["latencies"] and metrics["latencies"][0][0] < cutoff:
+        metrics["latencies"].popleft()
