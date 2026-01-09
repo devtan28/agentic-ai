@@ -1,16 +1,11 @@
-import os
-import logging, json
+import os, logging, json, random, time, copy, uuid
 from datetime import datetime
-import uuid
 from fastapi import Request
 from fastapi import FastAPI
 from dotenv import load_dotenv
 from fastapi import HTTPException, Header
 from fastapi.responses import JSONResponse
 from app.errors import ClientError, OperationalError
-import random
-import time
-import copy
 from typing import TypedDict
 from threading import Lock
 from collections import defaultdict
@@ -23,6 +18,14 @@ HEALTH_THRESHOLDS = {
     "max_retry_rate": 0.10,     # 10%
     "max_avg_latency_ms": 500,  # 500ms
 }
+
+CIRCUIT_STATE = {
+    "state": "CLOSED", # CLOSED | OPEN | HALF_OPEN
+    "opened_at": None,
+}
+
+CIRCUIT_OPEN_TIMEOUT = 5 # seconds
+
 metrics = {
     "requests_total": 0,
     "errors_total": 0,
@@ -121,7 +124,23 @@ async def add_request_id(request: Request, call_next):
                 "duration_ms": round(duration_ms, 2),
             },
         )
-   
+
+@app.middleware("http")
+async def circuit_breaker_guard(request: Request, call_next):
+    state = evaluate_cricuit()
+
+    if state == "OPEN":
+        logger.warning (
+            "Circuit breaker open - rejecting request",
+            extra= {"path": request.url.path},
+        )
+        return JSONResponse(
+            status_code = 503,
+            content={"detail": "Service temporarily unavailable"},
+        )
+    
+    return await call_next(request)
+
 def evaluate_health():
     if metrics["requests_total"] == 0:
         return {"status": "healthy", "reason": "no traffic yet"}
@@ -221,6 +240,7 @@ def call_with_retry(fn, retries: int = 3, delay: float = 0.5):
             return fn()
         except OperationalError as exc:
             last_exc = exc
+            metrics["retries_total"] += 1
             logger.warning(
                 "Retryable failure",
                 extra={"attempt": attempt, "error": str(exc)}
@@ -262,6 +282,28 @@ def health():
     )
 
     return health_state
+
+def evaluate_cricuit():
+    health = evaluate_health()
+    now = time.time()
+
+    if health["status"] == "unhealthy":
+        if CIRCUIT_STATE["state"] != "OPEN":
+            CIRCUIT_STATE["state"] = "OPEN"
+            CIRCUIT_STATE["opened_at"] = now
+        return CIRCUIT_STATE["state"]
+    
+    if CIRCUIT_STATE["state"] == "OPEN":
+        if now - CIRCUIT_STATE["opened_at"] > CIRCUIT_OPEN_TIMEOUT:
+            CIRCUIT_STATE["state"] = "HALF_OPEN"
+        return CIRCUIT_STATE["state"]
+    
+    if health["status"] == "degraded":
+        CIRCUIT_STATE["state"] = "HALF_OPEN"
+        return CIRCUIT_STATE["state"]
+    
+    CIRCUIT_STATE["state"] = "CLOSED"
+    return CIRCUIT_STATE["state"]
 
 @app.exception_handler(ClientError)
 async def client_error_handler(request: Request, exc: ClientError):
