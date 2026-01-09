@@ -15,6 +15,11 @@ IDEMPOTENCY_TTL_SECONDS = 60 * 60
 
 WINDOWS_SECONDS = 30
 
+HEALTH_STATE = {
+    "status": "healthy",
+    "since": time.time(),
+}
+
 metrics = {
     "requests": deque(),
     "errors": deque(),
@@ -27,9 +32,12 @@ metrics = {
 }
 
 HEALTH_THRESHOLDS = {
-    "max_error_rate": 0.05,     # 5%
-    "max_retry_rate": 0.10,     # 10%
-    "max_avg_latency_ms": 500,  # 500ms
+    "error_unhealthy": 0.05,
+
+    "retry_degraded_enter": 0.2,
+    "retry_degraded_exit": 0.05,
+
+    "min_state_duration": 10, # seconds
 }
 
 CIRCUIT_STATE = {
@@ -154,38 +162,34 @@ async def circuit_breaker_guard(request: Request, call_next):
 def evaluate_health():
     prune_old_events()
 
-    req_count = len(metrics["requests"])
-    err_count = len(metrics["errors"])
-    retry_count = len(metrics["retries"])
+    now = time.time()
+    current = HEALTH_STATE["status"]
+    since = HEALTH_STATE["since"]
 
-    if req_count == 0:
-        return {"status": "healthy", "reason": "no recent traffic"}
+    req = len(metrics["requests"])
+    if req == 0:
+        return HEALTH_STATE
     
-    error_rate = err_count / req_count
-    retry_rate = retry_count / req_count
+    error_rate = len(metrics["errors"]) / req
+    retry_rate = len(metrics["retries"]) / req
 
-    if metrics["requests_total"] == 0:
-        return {"status": "healthy", "reason": "no traffic yet"}
+    # UNHEALTHY dominates
+    if error_rate > HEALTH_THRESHOLDS["error_unhealthy"]:
+        return set_health("unhealthy", now, "error rate too high")
     
-    if error_rate > HEALTH_THRESHOLDS["max_error_rate"]:
-        return {
-            "status": "unhealthy",
-            "reason": "error rate too high",
-            "error_rate": round(error_rate, 3)
-        }
+    # DEGRADED transitions
+    if current == "healthy":
+        if retry_rate > HEALTH_THRESHOLDS["retry_degraded_enter"]:
+            return set_health("degraded", now, "retry rate high")
     
-    if retry_rate > HEALTH_THRESHOLDS["max_retry_rate"]:
-        return {
-            "status": "degraded",
-            "reason": "retry rate too high",
-            "retry_rate": round(retry_rate, 3)
-        }
-    
-    return {
-        "status": "healthy",
-        "error_rate": round(error_rate, 3),
-        "retry_rate": round(retry_rate, 3),
-    }
+    if current == "degraded":
+        if (
+            retry_rate < HEALTH_THRESHOLDS["retry_degraded_exit"]
+            and now - since > HEALTH_THRESHOLDS["min_state_duration"]
+        ):
+            return set_health("healthy", now, "recovered")
+        
+    return HEALTH_STATE
 
 def cleanup_idempotency_store():
     now = time.time()
@@ -420,7 +424,19 @@ def health(request: Request) -> dict:
         "request_id": request.state.request_id,
         }
 
+def set_health(status: str, now: float, reason: str):
+    HEALTH_STATE["status"] = status
+    HEALTH_STATE["since"] = now
+    HEALTH_STATE["reason"] = reason
+
+    logger.info(
+        "Health state transition",
+        extra={"status": status, "reason": reason}
+    )
+    return HEALTH_STATE
+
 def prune_old_events():
+
     cutoff = time.time() - WINDOWS_SECONDS
 
     for key in ["requests", "errors", "retries"]:
