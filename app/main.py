@@ -195,6 +195,164 @@ async def circuit_breaker_guard(request: Request, call_next):
         )
     return await call_next(request)
 
+@app.get("/")
+def root():
+    logger.info("Entered root handler")
+
+    raw_health = evaluate_health()
+    health = normalize_health(raw_health)
+
+    # DEGRADED -> fallback + Retry-After
+    if health["status"] == "degraded":
+        retry_after = BACKOFF_POLICY["degraded"]["retry_after"]
+
+        return JSONResponse(
+            status_code = 200,
+            headers={"Retry-After": str(retry_after)},
+            content={
+                "status": "degraded",
+                "message": "Serving fallback response",
+                "retry_after": retry_after,
+                "data": {
+                    "service": SERVICE_NAME,
+                    "mode": "fallback",
+                },
+            },
+        )
+
+    # UNHEALTHY -> explicity 503 (defensive)
+    if health["status"] == "unhealthy":
+        retry_after = BACKOFF_POLICY["unhealthy"]["retry_after"]
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": str(retry_after)},
+            content={
+                "status": "unhealthy",
+                "message": "Service unavailable",
+                "retry_after": retry_after,
+            },
+        )
+    
+    # HEALTHY -> normal response
+    return {
+        "status": "ok",
+        "service": SERVICE_NAME,
+        "environment": ENVIRONMENT,
+        "message": "Service is running",
+    }
+
+@app.post("/create-item")
+def create_item(
+    request: Request,
+    name: str,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    if not idempotency_key:
+        raise HTTPException(
+            status_code = 400,
+            detail="Idempotency_Key header is required",
+        )
+    with idempotency_lock:
+        record = idempotency_store.get(idempotency_key)
+
+    if record:
+        return copy.deepcopy(record["response"])
+    
+    #Simulation creation
+    item = {"id": len(idempotency_store) + 1, "name":name}
+    response = {"item":item}
+
+    idempotency_store[idempotency_key] = {
+        "response": copy.deepcopy(response),
+        "created_at": time.time()
+    }
+
+    logger.info(
+        "item created",
+        extra={
+            "request_id": request.state.request_id,
+            "idempotency_key": idempotency_key, 
+            "item_id": item["id"],
+            },
+    )
+
+    return response
+
+@app.get("/unstable")
+def unstable():
+    result = call_with_retry(unreliable_service)
+    return {"result": result}
+
+@app.get("/metrics")
+def get_metrics():
+    avg_latency = (
+        sum(metrics["latency_ms"]) / len(metrics["latency_ms"])
+        if metrics["latency_ms"]
+        else 0
+    )
+
+    return {
+        "request_total": metrics["requests_total"],
+        "errors_total": metrics["errors_total"],
+        "retries_total": metrics["retries_total"],
+        "avg_latency_ms": round(avg_latency, 2),
+    }
+
+@app.get("/square")
+def square(n: int):
+    #raise OperationalError("database unavailable")
+
+    if n < 0:
+        raise ClientError("n must be non-negative")
+    return {"n": n, "square": n * n}
+
+@app.get("/health")
+def health(request: Request):
+    health_state = evaluate_health()
+
+    response = {
+        "status": health_state.get("status"),
+        "since": health_state.get("since"),
+        "reason": health_state.get("reason", "ok"),
+        "service": SERVICE_NAME,
+        "environment": ENVIRONMENT,
+        "request_id": getattr(request.state, "request_id", None),
+    }
+
+    logger.info(
+        "Health evaluated",
+        extra={
+            "status": response["status"],
+            "reason": response["reason"],
+            "request_id": response["request_id"],
+        },
+    )
+
+    return response
+
+def unreliable_service() -> str:
+    if random.random() < 0.7:
+        raise OperationalError("Temporary upsteream error")
+    return "success"
+
+def call_with_retry(fn, retries: int = 3, delay: float = 0.5):
+    for attempt in range(1, retries + 1):
+        try:
+            return fn()
+        except OperationalError as exc:
+            last_exc = exc
+            metrics["retries_total"] += 1
+            metrics["retries"].append(time.time())
+            logger.warning(
+                "Retryable failure",
+                extra={"attempt": attempt, "error": str(exc)}
+            )
+        if attempt == retries:
+            raise last_exc
+        time.sleep(delay * attempt)
+    logger.warning("Retries exhausted - returning fallback")
+    return "fallback"
+
 def evaluate_health():
     prune_old_events()
 
@@ -242,98 +400,6 @@ def cleanup_idempotency_store():
     for key in expired_keys:
         del idempotency_store[key]
 
-@app.post("/create-item")
-def create_item(
-    request: Request,
-    name: str,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-):
-    if not idempotency_key:
-        raise HTTPException(
-            status_code = 400,
-            detail="Idempotency_Key header is required",
-        )
-    with idempotency_lock:
-        record = idempotency_store.get(idempotency_key)
-
-    if record:
-        return copy.deepcopy(record["response"])
-    
-    #Simulation creation
-    item = {"id": len(idempotency_store) + 1, "name":name}
-    response = {"item":item}
-
-    idempotency_store[idempotency_key] = {
-        "response": copy.deepcopy(response),
-        "created_at": time.time()
-    }
-
-    logger.info(
-        "item created",
-        extra={
-            "request_id": request.state.request_id,
-            "idempotency_key": idempotency_key, 
-            "item_id": item["id"],
-            },
-    )
-
-    return response
-
-def unreliable_service() -> str:
-    if random.random() < 0.7:
-        raise OperationalError("Temporary upsteream error")
-    return "success"
-
-def call_with_retry(fn, retries: int = 3, delay: float = 0.5):
-    for attempt in range(1, retries + 1):
-        try:
-            return fn()
-        except OperationalError as exc:
-            last_exc = exc
-            metrics["retries_total"] += 1
-            metrics["retries"].append(time.time())
-            logger.warning(
-                "Retryable failure",
-                extra={"attempt": attempt, "error": str(exc)}
-            )
-        if attempt == retries:
-            raise last_exc
-        time.sleep(delay * attempt)
-    logger.warning("Retries exhausted - returning fallback")
-    return "fallback"
-
-@app.get("/unstable")
-def unstable():
-    result = call_with_retry(unreliable_service)
-    return {"result": result}
-
-@app.get("/metrics")
-def get_metrics():
-    avg_latency = (
-        sum(metrics["latency_ms"]) / len(metrics["latency_ms"])
-        if metrics["latency_ms"]
-        else 0
-    )
-
-    return {
-        "request_total": metrics["requests_total"],
-        "errors_total": metrics["errors_total"],
-        "retries_total": metrics["retries_total"],
-        "avg_latency_ms": round(avg_latency, 2),
-    }
-
-    health_state = evaluate_health()
-
-    logger.info(
-        "Health evaluated",
-        extra={
-            "status": health_state["status"],
-            "reason": health_state.get("reason")
-        },
-    )
-
-    return health_state
-
 def evaluate_cricuit():
     health = evaluate_health()
     now = time.time()
@@ -355,6 +421,35 @@ def evaluate_cricuit():
     
     CIRCUIT_STATE["state"] = "CLOSED"
     return CIRCUIT_STATE["state"]
+
+def set_health(status: str, now: float, reason: str):
+    HEALTH_STATE["status"] = status
+    HEALTH_STATE["since"] = now
+    HEALTH_STATE["reason"] = reason
+
+    logger.info(
+        "Health state transition",
+        extra={"status": status, "reason": reason}
+    )
+    return HEALTH_STATE
+
+def normalize_health(health: dict) -> dict:
+    return {
+        "status": health.get("status"),
+        "reason": health.get("reason", "unspecified"),
+        "since": health.get("since"),
+    }
+
+def prune_old_events():
+
+    cutoff = time.time() - WINDOWS_SECONDS
+
+    for key in ["requests", "errors", "retries"]:
+        while metrics[key] and metrics[key][0] < cutoff:
+            metrics[key].popleft()
+
+    while metrics["latencies"] and metrics["latencies"][0][0] < cutoff:
+        metrics["latencies"].popleft()
 
 @app.exception_handler(ClientError)
 async def client_error_handler(request: Request, exc: ClientError):
@@ -392,110 +487,3 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"detail": "Internal server error"},
     )
-
-@app.get("/square")
-def square(n: int):
-    #raise OperationalError("database unavailable")
-
-    if n < 0:
-        raise ClientError("n must be non-negative")
-    return {"n": n, "square": n * n}
-
-@app.get("/")
-def root():
-    logger.info("Entered root handler")
-
-    raw_health = evaluate_health()
-    health = normalize_health(raw_health)
-
-    # DEGRADED -> fallback + Retry-After
-    if health["status"] == "degraded":
-        retry_after = BACKOFF_POLICY["degraded"]["retry_after"]
-
-        return JSONResponse(
-            status_code = 200,
-            headers={"Retry-After": str(retry_after)},
-            content={
-                "status": "degraded",
-                "message": "Serving fallback response",
-                "retry_after": retry_after,
-                "data": {
-                    "service": SERVICE_NAME,
-                    "mode": "fallback",
-                },
-            },
-        )
-
-    # UNHEALTHY -> explicity 503 (defensive)
-    if health["status"] == "unhealthy":
-        retry_after = BACKOFF_POLICY["unhealthy"]["retry_after"]
-        return JSONResponse(
-            status_code=503,
-            headers={"Retry-After": str(retry_after)},
-            content={
-                "status": "unhealthy",
-                "message": "Service unavailable",
-                "retry_after": retry_after,
-            },
-        )
-    
-    # HEALTHY -> normal response
-    return {
-        "status": "ok",
-        "service": SERVICE_NAME,
-        "environment": ENVIRONMENT,
-        "message": "Service is running",
-    }
-
-@app.get("/health")
-def health(request: Request):
-    health_state = evaluate_health()
-
-    response = {
-        "status": health_state.get("status"),
-        "since": health_state.get("since"),
-        "reason": health_state.get("reason", "ok"),
-        "service": SERVICE_NAME,
-        "environment": ENVIRONMENT,
-        "request_id": getattr(request.state, "request_id", None),
-    }
-
-    logger.info(
-        "Health evaluated",
-        extra={
-            "status": response["status"],
-            "reason": response["reason"],
-            "request_id": response["request_id"],
-        },
-    )
-
-    return response
-
-def set_health(status: str, now: float, reason: str):
-    HEALTH_STATE["status"] = status
-    HEALTH_STATE["since"] = now
-    HEALTH_STATE["reason"] = reason
-
-    logger.info(
-        "Health state transition",
-        extra={"status": status, "reason": reason}
-    )
-    return HEALTH_STATE
-
-def normalize_health(health: dict) -> dict:
-    return {
-        "status": health.get("status"),
-        "reason": health.get("reason", "unspecified"),
-        "since": health.get("since"),
-    }
-
-def prune_old_events():
-
-    cutoff = time.time() - WINDOWS_SECONDS
-
-    for key in ["requests", "errors", "retries"]:
-        while metrics[key] and metrics[key][0] < cutoff:
-            metrics[key].popleft()
-
-    while metrics["latencies"] and metrics["latencies"][0][0] < cutoff:
-        metrics["latencies"].popleft()
