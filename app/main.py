@@ -13,7 +13,16 @@ from collections import defaultdict, deque
 idempotency_lock = Lock()
 IDEMPOTENCY_TTL_SECONDS = 60 * 60
 
-WINDOWS_SECONDS = 30
+BACKOFF_POLICY = {
+    "degraded": {
+        "retry_after": 5,
+    },
+    "unhealthy": {
+        "retry_after": 20,
+    }
+}
+
+WINDOWS_SECONDS = 10
 
 HEALTH_STATE = {
     "status": "healthy",
@@ -32,10 +41,10 @@ metrics = {
 }
 
 HEALTH_THRESHOLDS = {
-    "error_unhealthy": 0.05,
+    "error_unhealthy": 0.30,
 
-    "retry_degraded_enter": 0.2,
-    "retry_degraded_exit": 0.05,
+    "retry_degraded_enter": 0.5,
+    "retry_degraded_exit": 0.2,
 
     "min_state_duration": 10, # seconds
 }
@@ -110,39 +119,59 @@ app = FastAPI()
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     start_time = time.time()
-
     request_id = str(uuid.uuid4())
     # attach to request state
     request.state.request_id = request_id
-
-    metrics["requests_total"] += 1
-    now = time.time()
-    metrics["requests"].append(now)
 
     logger.info(
         "Request started",
         extra={"request_id": request_id, "path": request.url.path},
     )
+
+    response = None
+    error_occured = False
+
+    # BEFORE REQUEST
+    metrics["requests_total"] += 1
+    now = time.time()
+    metrics["requests"].append(now)
+
     try:
         response = await call_next(request)
         return response
+    
     except Exception:
+        error_occured = True
         metrics["errors_total"] += 1
         metrics["errors"].append(time.time())
         raise
-    finally:
-        duration_ms = (time.time() - start_time) * 1000
-        metrics["latency_ms"].append(duration_ms)
-        metrics["latencies"].append((time.time(), duration_ms))
 
-        logger.info(
-            "Request completed",
-            extra={
-                "request_id": request_id,
-                "path": request.url.path,
-                "duration_ms": round(duration_ms, 2),
-            },
-        )
+    finally:
+        # AFTER request
+        try:
+            duration_ms = (time.time() - start_time) * 1000
+            metrics["latencies"].append((time.time(), duration_ms))
+
+            logger.info(
+                "Request completed",
+                extra={
+                    "request_id": request_id,
+                    "path": request.url.path,
+                    "duration_ms": round(duration_ms, 2),
+                    "error": error_occured,
+                },
+            )
+            if response is not None:
+                response.headers["X-Request-ID"] = request_id
+        
+        except Exception as middleware_error:
+            logger.error(
+                "Middleware error suppressed",
+                extra={
+                    "request_id": request_id,
+                    "error": str(middleware_error),
+                },
+            )
 
 @app.middleware("http")
 async def circuit_breaker_guard(request: Request, call_next):
@@ -153,9 +182,16 @@ async def circuit_breaker_guard(request: Request, call_next):
     state = evaluate_cricuit()
 
     if state == "OPEN":
+        retry_after = BACKOFF_POLICY["unhealthy"]["retry_after"]
+
         return JSONResponse(
             status_code = 503,
-            content={"detail": "Service temporarily unavailable"},
+            headers={"Retry-After": str(retry_after)},
+            content={
+                "status": "unhealthy",
+                "message": "Service unavailable",
+                "retry_after": retry_after,
+            },
         )
     return await call_next(request)
 
@@ -168,6 +204,10 @@ def evaluate_health():
 
     req = len(metrics["requests"])
     if req == 0:
+        return HEALTH_STATE
+    
+    MIN_REQUESTS = 20
+    if req < MIN_REQUESTS:
         return HEALTH_STATE
     
     error_rate = len(metrics["errors"]) / req
@@ -196,7 +236,7 @@ def cleanup_idempotency_store():
     expired_keys = [
         key 
         for key, record in idempotency_store.items()
-        if now - record["created at"] > IDEMPOTENCY_TTL_SECONDS
+        if now - record["created_at"] > IDEMPOTENCY_TTL_SECONDS
     ]
 
     for key in expired_keys:
@@ -225,7 +265,7 @@ def create_item(
 
     idempotency_store[idempotency_key] = {
         "response": copy.deepcopy(response),
-        "created at": time.time()
+        "created_at": time.time()
     }
 
     logger.info(
@@ -240,7 +280,7 @@ def create_item(
     return response
 
 def unreliable_service() -> str:
-    if random.random() < 0.5:
+    if random.random() < 0.7:
         raise OperationalError("Temporary upsteream error")
     return "success"
 
@@ -282,8 +322,6 @@ def get_metrics():
         "avg_latency_ms": round(avg_latency, 2),
     }
 
-@app.get("/health")
-def health():
     health_state = evaluate_health()
 
     logger.info(
@@ -340,32 +378,6 @@ async def operational_error_handler(request: Request, exc: OperationalError):
         content={"error_type": "operational_error", "detail": str(exc)},
     )
 
-@app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    request_id = str(uuid.uuid4())
-    request.state.request_id = request_id
-
-    logger.info(
-        "Request started",
-        extra={
-            "request_id": request_id,
-            "method": request.method,
-            "path": request.url.path,
-        },
-    )
-
-    response = await call_next(request)
-
-    logger.info(
-        "Request finished",
-        extra={
-            "request_id": request_id,
-            "status_code": response.status_code,
-        },
-    )
-
-    return response
-
 logger.info(
     "Service starting",
     extra={
@@ -391,18 +403,43 @@ def square(n: int):
 
 @app.get("/")
 def root():
-    health = evaluate_health()
+    logger.info("Entered root handler")
 
+    raw_health = evaluate_health()
+    health = normalize_health(raw_health)
+
+    # DEGRADED -> fallback + Retry-After
     if health["status"] == "degraded":
-        return {
-            "status": "degraded",
-            "message": "Serving fallback response",
-            "data": {
-                "service": SERVICE_NAME,
-                "mode": "fallback",
-            },
-        }
+        retry_after = BACKOFF_POLICY["degraded"]["retry_after"]
 
+        return JSONResponse(
+            status_code = 200,
+            headers={"Retry-After": str(retry_after)},
+            content={
+                "status": "degraded",
+                "message": "Serving fallback response",
+                "retry_after": retry_after,
+                "data": {
+                    "service": SERVICE_NAME,
+                    "mode": "fallback",
+                },
+            },
+        )
+
+    # UNHEALTHY -> explicity 503 (defensive)
+    if health["status"] == "unhealthy":
+        retry_after = BACKOFF_POLICY["unhealthy"]["retry_after"]
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": str(retry_after)},
+            content={
+                "status": "unhealthy",
+                "message": "Service unavailable",
+                "retry_after": retry_after,
+            },
+        )
+    
+    # HEALTHY -> normal response
     return {
         "status": "ok",
         "service": SERVICE_NAME,
@@ -411,18 +448,28 @@ def root():
     }
 
 @app.get("/health")
-def health(request: Request) -> dict:
-    logger.debug(
-        "Health check called",
-        extra={"request_id": request.state.request_id},
-        )
-    
-    return {
+def health(request: Request):
+    health_state = evaluate_health()
+
+    response = {
+        "status": health_state.get("status"),
+        "since": health_state.get("since"),
+        "reason": health_state.get("reason", "ok"),
         "service": SERVICE_NAME,
         "environment": ENVIRONMENT,
-        "message": "Status OK",
-        "request_id": request.state.request_id,
-        }
+        "request_id": getattr(request.state, "request_id", None),
+    }
+
+    logger.info(
+        "Health evaluated",
+        extra={
+            "status": response["status"],
+            "reason": response["reason"],
+            "request_id": response["request_id"],
+        },
+    )
+
+    return response
 
 def set_health(status: str, now: float, reason: str):
     HEALTH_STATE["status"] = status
@@ -434,6 +481,13 @@ def set_health(status: str, now: float, reason: str):
         extra={"status": status, "reason": reason}
     )
     return HEALTH_STATE
+
+def normalize_health(health: dict) -> dict:
+    return {
+        "status": health.get("status"),
+        "reason": health.get("reason", "unspecified"),
+        "since": health.get("since"),
+    }
 
 def prune_old_events():
 
